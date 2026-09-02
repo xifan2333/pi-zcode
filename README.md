@@ -41,7 +41,7 @@
 1. **Install the extension in Pi**:
 
    ```bash
-   pi install pi-zcode
+   pi install npm:pi-zcode
    ```
 
    Or install from local source:
@@ -109,7 +109,7 @@
 1. **在 Pi 中安装插件**：
 
    ```bash
-   pi install pi-zcode
+   pi install npm:pi-zcode
    ```
 
    或从本地源码安装：
