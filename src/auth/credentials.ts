@@ -1,19 +1,15 @@
-import { homedir } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readStoredCredential } from "@earendil-works/pi-coding-agent";
 import type { ZCodeParsedApiKey } from "../types/types.js";
 import { parseApiKey } from "../client/client.js";
 
-const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
-
-let cached: ZCodeParsedApiKey | undefined = undefined,
-  loadedAt = 0;
+let cached: ZCodeParsedApiKey | undefined = undefined;
+let loadedAt = 0;
 
 const CACHE_TTL_MS = 60 * 1000;
 
 /**
- * Read the stored `zcode` credentials from Pi's auth store directly. This keeps the
- * per-plan providers independent from re-login while reusing the single login entry.
+ * Read the stored `zcode` credentials using Pi's official `readStoredCredential` API.
+ * This keeps the per-plan providers independent while reusing the single login entry.
  */
 export function readStoredZCodeCredentials(force = false): ZCodeParsedApiKey | undefined {
   if (!force && cached && Date.now() - loadedAt < CACHE_TTL_MS) {
@@ -21,24 +17,21 @@ export function readStoredZCodeCredentials(force = false): ZCodeParsedApiKey | u
   }
 
   try {
-    if (!existsSync(AUTH_FILE)) {
+    const cred = readStoredCredential("zcode") as Record<string, unknown> | undefined;
+    if (!cred) {
       return undefined;
     }
-    const auth = JSON.parse(readFileSync(AUTH_FILE, "utf8")) as Record<string, unknown>,
-      zcode = auth.zcode as Record<string, unknown> | undefined;
-    if (!zcode) {
-      return undefined;
-    }
-    // Reconstruct the JSON form used by getZCodeApiKey.
-    const token = zcode.access as string | undefined,
-      parsed = parseApiKey(
-        JSON.stringify({
-          access: token,
-          businessAccessToken: zcode.businessAccessToken,
-          providerSource: zcode.providerSource,
-          zcodeJwtToken: zcode.zcodeJwtToken,
-        }),
-      );
+
+    const token = (cred.access as string | undefined) || (cred.key as string | undefined);
+    const parsed = parseApiKey(
+      JSON.stringify({
+        access: token,
+        businessAccessToken: cred.businessAccessToken,
+        providerSource: cred.providerSource,
+        zcodeJwtToken: cred.zcodeJwtToken,
+      }),
+    );
+
     cached = parsed;
     loadedAt = Date.now();
     return parsed;

@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
-const CONFIG_DIR = join(homedir(), ".pi", "zcode"),
-  CONFIG_FILE = join(CONFIG_DIR, "device.json");
+function getConfigDir(): string {
+  try {
+    return join(getAgentDir(), "zcode");
+  } catch {
+    return join(process.env.HOME || "", ".pi", "agent", "zcode");
+  }
+}
 
 interface DeviceConfig {
   deviceMid: string;
@@ -17,9 +22,12 @@ interface DeviceConfig {
  * trigger ZCode risk control (3012 / unusual activity).
  */
 export function getDeviceMid(): string {
+  const configDir = getConfigDir();
+  const configFile = join(configDir, "device.json");
+
   try {
-    if (existsSync(CONFIG_FILE)) {
-      const config = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as DeviceConfig;
+    if (existsSync(configFile)) {
+      const config = JSON.parse(readFileSync(configFile, "utf8")) as DeviceConfig;
       if (typeof config.deviceMid === "string" && config.deviceMid.trim()) {
         return config.deviceMid.trim();
       }
@@ -30,11 +38,11 @@ export function getDeviceMid(): string {
 
   const deviceMid = randomUUID();
   try {
-    if (!existsSync(CONFIG_DIR)) {
-      mkdirSync(CONFIG_DIR, { recursive: true });
+    if (!existsSync(configDir)) {
+      mkdirSync(configDir, { recursive: true });
     }
     const config: DeviceConfig = { createdAt: Date.now(), deviceMid };
-    writeFileSync(CONFIG_FILE, JSON.stringify(config, undefined, 2), "utf8");
+    writeFileSync(configFile, JSON.stringify(config, undefined, 2), "utf8");
   } catch {
     // Ignore filesystem errors; still return the generated id for this session.
   }
