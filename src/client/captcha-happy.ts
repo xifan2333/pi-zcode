@@ -22,7 +22,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getZCodeCacheDir } from "../utils/util.js";
 
 // -- Blocking fetch for sync XHR (self-contained builds) --------------------
 // happy-dom implements sync XHR by spawning `process.argv[0] -e <script>`,
@@ -139,13 +139,7 @@ function shutdownSyncFetchWorker(): void {
   _syncFetchWorker = null;
 }
 
-const CDN_CACHE_DIR = (() => {
-  try {
-    return path.join(getAgentDir(), "cache", "zcode-captcha");
-  } catch {
-    return path.join(os.homedir(), ".pi", "agent", "cache", "zcode-captcha");
-  }
-})();
+const CDN_CACHE_DIR = path.join(getZCodeCacheDir(), "cdn");
 const _memCdnCache = new Map();
 let _cookieCache = { cookies: [], ts: 0 };
 const COOKIE_CACHE_TTL_MS = 5 * 60 * 1000;

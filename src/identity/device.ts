@@ -1,15 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
-
-function getConfigDir(): string {
-  try {
-    return join(getAgentDir(), "zcode");
-  } catch {
-    return join(process.env.HOME || "", ".pi", "agent", "zcode");
-  }
-}
+import { getZCodeDataDir } from "../utils/util.js";
 
 interface DeviceConfig {
   deviceMid: string;
@@ -22,7 +14,7 @@ interface DeviceConfig {
  * trigger ZCode risk control (3012 / unusual activity).
  */
 export function getDeviceMid(): string {
-  const configDir = getConfigDir();
+  const configDir = getZCodeDataDir();
   const configFile = join(configDir, "device.json");
 
   try {

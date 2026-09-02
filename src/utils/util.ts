@@ -1,3 +1,7 @@
+import os from "node:os";
+import path from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+
 /**
  * Read environment variable with prefix fallback.
  */
@@ -9,6 +13,53 @@ export function zcodeEnv(key: string): string | undefined {
     process.env[`BIGMODEL_${key}`] ||
     process.env[key]
   );
+}
+
+/**
+ * Resolve standard OS cache directory adhering to XDG / macOS / Windows standards.
+ */
+export function getZCodeCacheDir(): string {
+  const custom = zcodeEnv("CACHE_DIR");
+  if (custom?.trim()) {
+    return path.resolve(custom.trim());
+  }
+
+  // Linux / POSIX (XDG specification)
+  if (process.platform === "linux") {
+    const xdgCache = process.env.XDG_CACHE_HOME;
+    return xdgCache
+      ? path.join(xdgCache, "pi-zcode")
+      : path.join(os.homedir(), ".cache", "pi-zcode");
+  }
+
+  // macOS
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Caches", "pi-zcode");
+  }
+
+  // Windows
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    return path.join(localAppData, "pi-zcode", "Cache");
+  }
+
+  // Fallback inside Pi agent directory
+  try {
+    return path.join(getAgentDir(), "cache", "zcode");
+  } catch {
+    return path.join(os.homedir(), ".cache", "pi-zcode");
+  }
+}
+
+/**
+ * Resolve persistent state directory respecting Pi's agent environment.
+ */
+export function getZCodeDataDir(): string {
+  try {
+    return path.join(getAgentDir(), "zcode");
+  } catch {
+    return path.join(os.homedir(), ".pi", "agent", "zcode");
+  }
 }
 
 /**
