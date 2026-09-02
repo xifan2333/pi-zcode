@@ -4,9 +4,19 @@
   "description": "ZCode / Z.AI model provider for Pi Coding Agent",
   "type": "module",
   "main": "./src/index.ts",
+  "author": "xifan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xifan2333/pi-zcode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xifan2333/pi-zcode/issues"
+  },
+  "homepage": "https://github.com/xifan2333/pi-zcode#readme",
   "files": [
     "README.md",
     "src",
+    "index.ts",
     "tsconfig.json"
   ],
   "scripts": {
