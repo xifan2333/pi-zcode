@@ -1,0 +1,755 @@
+import crypto from "node:crypto";
+import {
+  calculateCost,
+  createAssistantMessageEventStream,
+  type Api,
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Context,
+  type Model,
+  type SimpleStreamOptions,
+  type TextContent,
+  type ThinkingContent,
+  type Tool,
+  type ToolCall,
+} from "@earendil-works/pi-ai";
+import {
+  acquireCaptchaVerifyParam,
+  buildStartPlanHeaders,
+  buildZCodeHeaders,
+  getOrSolveCaptchaParam,
+  getStagedCaptchaParam,
+  parseApiKey,
+  resolveBaseHost,
+  solveCaptchaHeadless,
+} from "../client/index.js";
+import {
+  setLastEndpoint,
+  setLastError,
+  setLastLatencyMs,
+  setLastRequestId,
+  setLastResolvedRuntimeModel,
+  setLastStatus,
+} from "../diagnostics/diagnostics.js";
+import { ZCodePlan } from "../types/enums.js";
+import { ZCODE_API } from "../types/types.js";
+import { redactSecrets } from "../utils/security.js";
+import { zcodeEnv } from "../utils/util.js";
+import { buildZCodeStartPlanSystem } from "./system-prompt.js";
+
+export { ZCODE_API } from "../types/types.js";
+
+const MAX_TRANSIENT_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 1000;
+
+/** Modes we never retry without action (auth / hard risk control). */
+const NON_RETRYABLE_PATTERN =
+  /3001|401|403|invalid api key|token expired|authentication failed|parameter error/i;
+
+function friendlyZCodeError(status: number | undefined, text: string): string {
+  const msg = redactSecrets(text).slice(0, 500);
+  if (/context_length_exceeded|maximum context length/i.test(msg)) {
+    return `context_length_exceeded: ${msg}`;
+  }
+  if (/3007|captcha verify failed/i.test(msg)) {
+    return `Captcha verification failed for Start Plan. Please check network connection or retry.`;
+  }
+  if (/3009|3010|concurrency limit|system is busy/i.test(msg)) {
+    return `Start Plan model is currently busy or concurrency limit reached. Please retry shortly.`;
+  }
+  if (/3012|unusual activity/i.test(msg)) {
+    return `ZCode gateway check rejected request. Please check /zcode.doctor.`;
+  }
+  if (/1113|insufficient balance|arrear|no resource package/i.test(msg)) {
+    return `Insufficient balance or no active plan for this model. Run /login zcode to refresh.`;
+  }
+  if (/1004|1000|invalid api key|token expired|authentication failed/i.test(msg)) {
+    return `Authentication failed. Run /login zcode to re-authenticate.`;
+  }
+  if (/1305|overloaded/i.test(msg)) {
+    return `The model is currently overloaded. Please retry in a few moments.`;
+  }
+  if (/1211|model not found/i.test(msg)) {
+    return `Model is not available or not enabled for this account.`;
+  }
+  if (status === 400) {
+    return `Request rejected (${msg}). Please verify model parameters.`;
+  }
+  if (status === 401) {
+    return "Authentication failed. Next: run /login zcode.";
+  }
+  if (status === 403) {
+    return `Access denied (${msg}). Next: check account entitlement.`;
+  }
+  if (status === 429) {
+    return `Rate limit exceeded. Please wait a moment and retry.`;
+  }
+  if (status && status >= 500) {
+    return `Server error (${status}: ${msg}). Next: retry in a moment.`;
+  }
+  return msg || "Unknown API error";
+}
+
+function convertTools(tools?: Tool[]): Record<string, unknown>[] | undefined {
+  if (!tools || tools.length === 0) {
+    return undefined;
+  }
+  return tools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    input_schema: tool.parameters,
+  }));
+}
+
+function convertMessages(context: Context, isStartPlan = false): Record<string, unknown>[] {
+  const messages: Record<string, unknown>[] = [];
+
+  for (const message of context.messages) {
+    if (message.role === "user") {
+      if (typeof message.content === "string") {
+        messages.push({
+          role: "user",
+          content: message.content,
+          ...(isStartPlan ? { cache_control: { type: "ephemeral" } } : {}),
+        });
+      } else if (Array.isArray(message.content)) {
+        const parts: Record<string, unknown>[] = [];
+        for (const part of message.content) {
+          if (part.type === "text") {
+            parts.push({
+              type: "text",
+              text: part.text,
+              ...(isStartPlan ? { cache_control: { type: "ephemeral" } } : {}),
+            });
+          } else if (part.type === "image") {
+            parts.push({
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: part.mimeType,
+                data: part.data,
+              },
+            });
+          }
+        }
+        messages.push({ role: "user", content: parts });
+      }
+    } else if (message.role === "assistant") {
+      const parts: Record<string, unknown>[] = [];
+      if (typeof message.content === "string") {
+        if (message.content) parts.push({ type: "text", text: message.content });
+      } else if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (part.type === "text" && part.text) {
+            parts.push({ type: "text", text: part.text });
+          } else if (part.type === "toolCall") {
+            parts.push({
+              type: "tool_use",
+              id: part.id,
+              name: part.name,
+              input: part.arguments,
+            });
+          }
+        }
+      }
+      messages.push({ role: "assistant", content: parts });
+    } else if (message.role === "toolResult") {
+      let contentStr = "";
+      if (typeof message.content === "string") {
+        contentStr = message.content;
+      } else if (Array.isArray(message.content)) {
+        contentStr = message.content
+          .filter((p) => p.type === "text")
+          .map((p) => (p as TextContent).text)
+          .join("\n");
+      }
+
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: message.toolCallId,
+            content: contentStr,
+          },
+        ],
+      });
+    }
+  }
+
+  return messages;
+}
+
+function resolveEndpointForPlan(
+  plan: ZCodePlan,
+  model: Model<Api>,
+  auth: ReturnType<typeof parseApiKey>,
+): string {
+  const explicit = zcodeEnv("BASE_URL")?.trim();
+  if (explicit && plan !== ZCodePlan.START_PLAN) {
+    return explicit.endsWith("/chat/completions")
+      ? explicit
+      : `${explicit.replace(/\/+$/, "")}/api/paas/v4/chat/completions`;
+  }
+
+  // Start Plan goes through the ZCode shared plan proxy.
+  if (plan === ZCodePlan.START_PLAN) {
+    return "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages";
+  }
+
+  if (model.baseUrl) {
+    return model.baseUrl.endsWith("/chat/completions")
+      ? model.baseUrl
+      : `${model.baseUrl.replace(/\/+$/, "")}/api/paas/v4/chat/completions`;
+  }
+
+  const host = resolveBaseHost(auth);
+  return `${host}/api/coding/paas/v4/chat/completions`;
+}
+
+function buildRequestHeaders(
+  plan: ZCodePlan,
+  auth: ReturnType<typeof parseApiKey>,
+  captcha?: { param: string; region: string },
+): Record<string, string> {
+  if (plan === ZCodePlan.START_PLAN) {
+    const sessionId = crypto.randomUUID();
+    const traceId = crypto.randomUUID();
+    const requestId = crypto.randomUUID();
+    const queryId = `01a0${crypto.randomBytes(14).toString("hex")}`;
+
+    const extra: Record<string, string> = {
+      "x-zcode-agent": "glm",
+      "x-release-channel": "production",
+      "x-client-language": "zh-CN",
+      "x-request-id": requestId,
+      "x-zcode-session-type": "main",
+      "x-zcode-trace-id": traceId,
+      "x-query-id": queryId,
+      "x-session-id": sessionId,
+    };
+
+    const effectiveCaptcha = captcha || getStagedCaptchaParam();
+    if (effectiveCaptcha?.param) {
+      extra["x-aliyun-captcha-verify-param"] = effectiveCaptcha.param;
+      if (effectiveCaptcha.region) {
+        extra["x-aliyun-captcha-verify-region"] = effectiveCaptcha.region;
+      }
+    }
+    return buildStartPlanHeaders(auth, extra);
+  }
+  return buildZCodeHeaders(auth);
+}
+
+function buildRequestBody({
+  model,
+  context,
+  options,
+  plan,
+}: {
+  model: Model<Api>;
+  context: Context;
+  options: SimpleStreamOptions | undefined;
+  plan: ZCodePlan;
+}): Record<string, unknown> {
+  if (plan === ZCodePlan.START_PLAN) {
+    const system = buildZCodeStartPlanSystem(context.systemPrompt, model.id);
+    const messages = convertMessages(context, true);
+    const tools = convertTools(context.tools);
+
+    const body: Record<string, unknown> = {
+      model: model.id,
+      max_tokens: model.maxTokens || 128000,
+      system,
+      messages,
+      stream: true,
+      temperature: options?.temperature ?? 0.7,
+    };
+
+    if (tools && tools.length > 0) {
+      body.tools = tools;
+      body.tool_choice = { type: "auto" };
+    }
+
+    if (model.reasoning) {
+      body.thinking = { type: "enabled", budget_tokens: 8000 };
+      body.output_config = { effort: "low" };
+    }
+
+    return body;
+  }
+
+  // Standard PaaS chat completions format
+  const body: Record<string, unknown> = {
+    model: model.id,
+    messages: convertMessages(context, false),
+    max_tokens: model.maxTokens || 4096,
+    stream: true,
+    temperature: options?.temperature ?? 0.7,
+  };
+
+  const tools = convertTools(context.tools);
+  if (tools) body.tools = tools;
+  if (model.reasoning && options?.reasoning) {
+    body.reasoning_effort = model.thinkingLevelMap?.[options.reasoning] || "medium";
+  }
+
+  return body;
+}
+
+function isTransientRetryable(text: string): boolean {
+  return (
+    /1305|3009|3010|overloaded|concurrency limit|temporarily overloaded|429|529/i.test(text) &&
+    !NON_RETRYABLE_PATTERN.test(text)
+  );
+}
+
+/**
+ * Native simple stream implementation for ZCode, dispatched by the model's plan.
+ */
+export function streamZCode(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+  const plan = resolvePlanFromModel(model);
+
+  (async () => {
+    const startTime = Date.now();
+    const output: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      api: ZCODE_API,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+
+    let textBlockIndex = -1;
+    let thinkingBlockIndex = -1;
+    const toolCallIndices = new Map<number, number>();
+    const toolCallRawArgs = new Map<number, string>();
+
+    try {
+      const auth = parseApiKey(options?.apiKey);
+      if (!auth.token && !auth.zcodeJwtToken) {
+        throw new Error("Missing ZCode credentials. Run /login zcode first.");
+      }
+
+      const endpoint = resolveEndpointForPlan(plan, model, auth);
+      setLastEndpoint(endpoint);
+      setLastResolvedRuntimeModel(model.id);
+
+      let captchaParam: { param: string; region: string } | undefined = undefined;
+      if (plan === ZCodePlan.START_PLAN) {
+        try {
+          captchaParam = await getOrSolveCaptchaParam(auth.zcodeJwtToken);
+        } catch {
+          // background solve failed; continue with staged/empty and auto-recover on 3007
+        }
+      }
+
+      let headers = buildRequestHeaders(plan, auth, captchaParam);
+      const requestBody = buildRequestBody({ model, context, options, plan });
+
+      stream.push({ type: "start", partial: output });
+
+      let res: Response | undefined = undefined;
+      let lastErrText = "";
+
+      for (let attempt = 0; attempt < MAX_TRANSIENT_RETRIES; attempt++) {
+        if (options?.signal?.aborted) {
+          throw new Error("Request aborted");
+        }
+        if (attempt > 0) {
+          const delay = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+          await new Promise((r) => setTimeout(r, delay));
+        }
+
+        const candidateRes = await fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(requestBody),
+          signal: options?.signal,
+        });
+
+        setLastStatus(candidateRes.status);
+        const requestId = candidateRes.headers.get("x-request-id") || undefined;
+        if (requestId) setLastRequestId(requestId);
+
+        if (candidateRes.ok) {
+          res = candidateRes;
+          break;
+        }
+
+        lastErrText = await candidateRes.text().catch(() => "");
+
+        // Auto-recover from 3007 (Captcha required on Start Plan) by solving headlessly in background
+        if (
+          /3007|captcha verify failed/i.test(lastErrText) &&
+          plan === ZCodePlan.START_PLAN &&
+          attempt === 0
+        ) {
+          try {
+            const verified = await solveCaptchaHeadless(auth.zcodeJwtToken);
+            if (verified?.captchaVerifyParam) {
+              headers = buildRequestHeaders(plan, auth, {
+                param: verified.captchaVerifyParam,
+                region: verified.captchaRegion,
+              });
+              continue; // retry immediately with the fresh captcha header
+            }
+          } catch {
+            // fallback
+          }
+        }
+
+        if (isTransientRetryable(lastErrText) && attempt < MAX_TRANSIENT_RETRIES - 1) {
+          continue;
+        }
+
+        const friendly = friendlyZCodeError(candidateRes.status, lastErrText);
+        setLastError(friendly);
+        setLastLatencyMs(Date.now() - startTime);
+        throw new Error(friendly);
+      }
+
+      if (!res || !res.ok) {
+        const friendly = friendlyZCodeError(res?.status, lastErrText);
+        setLastError(friendly);
+        setLastLatencyMs(Date.now() - startTime);
+        throw new Error(friendly);
+      }
+
+      if (!res.body) {
+        throw new Error("Empty response body received from API");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        if (options?.signal?.aborted) {
+          output.stopReason = "aborted";
+          break;
+        }
+
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line || line.startsWith(":") || line.startsWith("event:")) {
+            continue;
+          }
+
+          if (line.startsWith("data:")) {
+            const dataStr = line.slice(5).trim();
+            if (dataStr === "[DONE]") continue;
+
+            let chunk: Record<string, unknown> | undefined = undefined;
+            try {
+              chunk = JSON.parse(dataStr) as Record<string, unknown>;
+            } catch {
+              continue;
+            }
+
+            if (chunk.error) {
+              const errObj = chunk.error as { message?: string };
+              throw new Error(friendlyZCodeError(res.status, errObj.message || "Streaming error"));
+            }
+
+            // 1. Anthropic format events (content_block_delta, message_delta)
+            if (chunk.type === "content_block_delta") {
+              const delta = chunk.delta as
+                { type?: string; text?: string; thinking?: string } | undefined;
+              if (delta?.type === "text_delta" && delta.text) {
+                if (textBlockIndex === -1) {
+                  const block: TextContent = { type: "text", text: delta.text };
+                  output.content.push(block);
+                  textBlockIndex = output.content.length - 1;
+                  stream.push({
+                    type: "text_start",
+                    contentIndex: textBlockIndex,
+                    partial: output,
+                  });
+                } else {
+                  const block = output.content[textBlockIndex] as TextContent;
+                  block.text += delta.text;
+                  stream.push({
+                    type: "text_delta",
+                    contentIndex: textBlockIndex,
+                    delta: delta.text,
+                    partial: output,
+                  });
+                }
+              } else if (delta?.type === "thinking_delta" && delta.thinking) {
+                if (thinkingBlockIndex === -1) {
+                  const block: ThinkingContent = {
+                    type: "thinking",
+                    thinking: delta.thinking,
+                  };
+                  output.content.push(block);
+                  thinkingBlockIndex = output.content.length - 1;
+                  stream.push({
+                    type: "thinking_start",
+                    contentIndex: thinkingBlockIndex,
+                    partial: output,
+                  });
+                } else {
+                  const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                  block.thinking += delta.thinking;
+                  stream.push({
+                    type: "thinking_delta",
+                    contentIndex: thinkingBlockIndex,
+                    delta: delta.thinking,
+                    partial: output,
+                  });
+                }
+              }
+            } else if (chunk.type === "message_delta") {
+              const delta = chunk.delta as { stop_reason?: string } | undefined;
+              if (delta?.stop_reason === "tool_use") output.stopReason = "toolUse";
+              else if (delta?.stop_reason === "max_tokens") output.stopReason = "length";
+              else output.stopReason = "stop";
+
+              const usage = chunk.usage as { output_tokens?: number } | undefined;
+              if (usage?.output_tokens) {
+                output.usage.output = usage.output_tokens;
+                output.usage.totalTokens = output.usage.input + output.usage.output;
+                calculateCost(model, output.usage);
+              }
+            }
+
+            // 2. OpenAI format events (choices[0].delta)
+            const choices = chunk.choices as
+              | Array<{
+                  finish_reason?: string;
+                  delta?: {
+                    content?: string;
+                    reasoning_content?: string;
+                    tool_calls?: Array<{
+                      index?: number;
+                      id?: string;
+                      function?: { name?: string; arguments?: string };
+                    }>;
+                  };
+                }>
+              | undefined;
+
+            if (choices && choices.length > 0) {
+              const choice = choices[0];
+              if (choice.finish_reason) {
+                if (choice.finish_reason === "tool_calls") output.stopReason = "toolUse";
+                else if (choice.finish_reason === "length") output.stopReason = "length";
+                else output.stopReason = "stop";
+              }
+
+              const delta = choice.delta;
+              if (delta?.reasoning_content) {
+                if (thinkingBlockIndex === -1) {
+                  const block: ThinkingContent = {
+                    type: "thinking",
+                    thinking: delta.reasoning_content,
+                  };
+                  output.content.push(block);
+                  thinkingBlockIndex = output.content.length - 1;
+                  stream.push({
+                    type: "thinking_start",
+                    contentIndex: thinkingBlockIndex,
+                    partial: output,
+                  });
+                } else {
+                  const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                  block.thinking += delta.reasoning_content;
+                  stream.push({
+                    type: "thinking_delta",
+                    contentIndex: thinkingBlockIndex,
+                    delta: delta.reasoning_content,
+                    partial: output,
+                  });
+                }
+              }
+
+              if (delta?.content) {
+                if (thinkingBlockIndex !== -1) {
+                  const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                  stream.push({
+                    type: "thinking_end",
+                    contentIndex: thinkingBlockIndex,
+                    content: block.thinking,
+                    partial: output,
+                  });
+                  thinkingBlockIndex = -1;
+                }
+
+                if (textBlockIndex === -1) {
+                  const block: TextContent = { type: "text", text: delta.content };
+                  output.content.push(block);
+                  textBlockIndex = output.content.length - 1;
+                  stream.push({
+                    type: "text_start",
+                    contentIndex: textBlockIndex,
+                    partial: output,
+                  });
+                } else {
+                  const block = output.content[textBlockIndex] as TextContent;
+                  block.text += delta.content;
+                  stream.push({
+                    type: "text_delta",
+                    contentIndex: textBlockIndex,
+                    delta: delta.content,
+                    partial: output,
+                  });
+                }
+              }
+
+              if (delta?.tool_calls && Array.isArray(delta.tool_calls)) {
+                for (const tc of delta.tool_calls) {
+                  const callIdx = tc.index ?? 0;
+                  if (!toolCallIndices.has(callIdx)) {
+                    const block: ToolCall = {
+                      type: "toolCall",
+                      id: tc.id || `call_${Date.now()}_${callIdx}`,
+                      name: tc.function?.name || "",
+                      arguments: {},
+                    };
+                    output.content.push(block);
+                    const contentIdx = output.content.length - 1;
+                    toolCallIndices.set(callIdx, contentIdx);
+                    toolCallRawArgs.set(callIdx, tc.function?.arguments || "");
+                    stream.push({
+                      type: "toolcall_start",
+                      contentIndex: contentIdx,
+                      partial: output,
+                    });
+                  } else {
+                    const contentIdx = toolCallIndices.get(callIdx)!;
+                    const block = output.content[contentIdx] as ToolCall;
+                    if (tc.function?.name && !block.name) block.name = tc.function.name;
+                    if (tc.function?.arguments) {
+                      const prevArgs = toolCallRawArgs.get(callIdx) || "";
+                      const newArgs = prevArgs + tc.function.arguments;
+                      toolCallRawArgs.set(callIdx, newArgs);
+                      try {
+                        block.arguments = JSON.parse(newArgs);
+                      } catch {
+                        // incomplete JSON
+                      }
+                      stream.push({
+                        type: "toolcall_delta",
+                        contentIndex: contentIdx,
+                        delta: tc.function.arguments,
+                        partial: output,
+                      });
+                    }
+                  }
+                }
+              }
+            }
+
+            // Usage update
+            const chunkUsage = chunk.usage as
+              | {
+                  prompt_tokens?: number;
+                  completion_tokens?: number;
+                  prompt_tokens_details?: { cached_tokens?: number };
+                }
+              | undefined;
+
+            if (chunkUsage) {
+              const inTokens = chunkUsage.prompt_tokens || 0;
+              const outTokens = chunkUsage.completion_tokens || 0;
+              const cached = chunkUsage.prompt_tokens_details?.cached_tokens || 0;
+              output.usage.input = inTokens;
+              output.usage.output = outTokens;
+              output.usage.cacheRead = cached;
+              output.usage.totalTokens = inTokens + outTokens;
+              calculateCost(model, output.usage);
+            }
+          }
+        }
+      }
+
+      // Close open blocks
+      if (thinkingBlockIndex !== -1) {
+        const block = output.content[thinkingBlockIndex] as ThinkingContent;
+        stream.push({
+          type: "thinking_end",
+          contentIndex: thinkingBlockIndex,
+          content: block.thinking,
+          partial: output,
+        });
+      }
+      if (textBlockIndex !== -1) {
+        const block = output.content[textBlockIndex] as TextContent;
+        stream.push({
+          type: "text_end",
+          contentIndex: textBlockIndex,
+          content: block.text,
+          partial: output,
+        });
+      }
+      for (const [callIdx, contentIdx] of toolCallIndices.entries()) {
+        const block = output.content[contentIdx] as ToolCall;
+        const rawArgs = toolCallRawArgs.get(callIdx) || "{}";
+        try {
+          block.arguments = JSON.parse(rawArgs);
+        } catch {
+          block.arguments = {};
+        }
+        stream.push({
+          type: "toolcall_end",
+          contentIndex: contentIdx,
+          toolCall: block,
+          partial: output,
+        });
+      }
+
+      setLastLatencyMs(Date.now() - startTime);
+      setLastError(undefined);
+
+      const doneReason =
+        output.stopReason === "toolUse" ||
+        output.stopReason === "length" ||
+        output.stopReason === "deferred"
+          ? output.stopReason
+          : "stop";
+
+      stream.push({ type: "done", reason: doneReason, message: output });
+      stream.end();
+    } catch (error) {
+      setLastLatencyMs(Date.now() - startTime);
+      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+      output.errorMessage = error instanceof Error ? error.message : String(error);
+      setLastError(output.errorMessage);
+
+      stream.push({ type: "error", reason: output.stopReason, error: output });
+      stream.end();
+    }
+  })();
+
+  return stream;
+}
+
+function resolvePlanFromModel(model: Model<Api>): ZCodePlan {
+  if (model.provider === "zcode-individual-plan" || model.provider === "zcode-individual") {
+    return ZCodePlan.INDIVIDUAL_PLAN;
+  }
+  return ZCodePlan.START_PLAN;
+}

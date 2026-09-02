@@ -1,0 +1,52 @@
+{
+  "name": "pi-zcode",
+  "version": "0.1.0",
+  "description": "ZCode / Z.AI model provider for Pi Coding Agent",
+  "type": "module",
+  "main": "./src/index.ts",
+  "files": [
+    "README.md",
+    "src",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src index.ts",
+    "lint:fix": "oxlint --fix src index.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "tsc --noEmit && oxlint src index.ts && prettier --check ."
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-provider",
+    "zcode",
+    "z.ai",
+    "bigmodel",
+    "glm",
+    "glm-5"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.0",
+    "@earendil-works/pi-coding-agent": ">=0.80.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.0",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@types/node": "^26.1.1",
+    "oxlint": "^1.78.0",
+    "prettier": "^3.8.1",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "happy-dom": "^20.13.1",
+    "undici": "^8.10.1"
+  }
+}
