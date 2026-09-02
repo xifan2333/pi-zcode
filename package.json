@@ -1,6 +1,6 @@
 {
   "name": "pi-zcode",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "ZCode / Z.AI model provider for Pi Coding Agent",
   "type": "module",
   "main": "./src/index.ts",
@@ -29,6 +29,7 @@
     "check": "tsc --noEmit && oxlint src index.ts && prettier --check ."
   },
   "keywords": [
+    "pi-package",
     "pi",
     "pi-extension",
     "pi-provider",
