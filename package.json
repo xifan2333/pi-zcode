@@ -1,6 +1,6 @@
 {
   "name": "pi-zcode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ZCode / Z.AI model provider for Pi Coding Agent",
   "type": "module",
   "main": "./src/index.ts",
@@ -15,6 +15,7 @@
   "homepage": "https://github.com/xifan2333/pi-zcode#readme",
   "files": [
     "README.md",
+    "README.zh-CN.md",
     "src",
     "index.ts",
     "tsconfig.json"
