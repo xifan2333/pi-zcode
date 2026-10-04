@@ -241,6 +241,43 @@ function buildRequestHeaders(
   return buildZCodeHeaders(auth);
 }
 
+/**
+ * Model-level sampling overrides from models.json (`modelOverrides` /
+ * `samplingParams` + `samplingParamsByThinkingLevel`) merged per the effective
+ * thinking level. Free-form keys are forwarded into the request body except the
+ * keys pi/zcode owns structurally. Without this, custom providers silently
+ * ignore models.json sampling configuration (pi-ai only applies it for the
+ * built-in OpenAI-family APIs).
+ */
+const RESERVED_BODY_KEYS = new Set([
+  "model",
+  "messages",
+  "max_tokens",
+  "stream",
+  "tools",
+  "tool_choice",
+  "output_config",
+  "reasoning_effort",
+  "thinking",
+  "request_id",
+  "response_format",
+]);
+
+function modelSamplingOverrides(
+  model: Model<Api>,
+  options?: SimpleStreamOptions,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...model.samplingParams };
+  const perLevel = model.samplingParamsByThinkingLevel;
+  const level = options?.reasoning;
+  if (perLevel && level) {
+    Object.assign(merged, perLevel[level] ?? {});
+  }
+  return Object.fromEntries(
+    Object.entries(merged).filter(([key]) => !RESERVED_BODY_KEYS.has(key)),
+  );
+}
+
 function buildRequestBody({
   model,
   context,
@@ -276,6 +313,13 @@ function buildRequestBody({
       body.output_config = { effort: "low" };
     }
 
+    // Forward model-level sampling overrides. temperature stays omitted while
+    // thinking is enabled (official anthropic adapter semantics above); other
+    // free-form keys (top_p, top_k, ...) are valid on the anthropic surface.
+    const anthropicSampling = modelSamplingOverrides(model, options);
+    if (body.thinking) delete anthropicSampling.temperature;
+    Object.assign(body, anthropicSampling);
+
     return body;
   }
 
@@ -293,6 +337,11 @@ function buildRequestBody({
   if (model.reasoning && options?.reasoning) {
     body.reasoning_effort = model.thinkingLevelMap?.[options.reasoning] || "medium";
   }
+
+    // Forward model-level sampling overrides (temperature/top_p/top_k/...).
+    // Merged temperature wins over the 0.7 fallback; reserved keys are filtered
+    // so reasoning_effort/output_config stay authoritative.
+    Object.assign(body, modelSamplingOverrides(model, options));
 
   return body;
 }
