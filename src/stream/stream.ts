@@ -263,12 +263,16 @@ const RESERVED_BODY_KEYS = new Set([
   "response_format",
 ]);
 
+/** pi >=1.0.2 model metadata; absent (undefined) on older pi-ai. */
+type PerLevelSampling = Record<string, Record<string, unknown>>;
+
 function modelSamplingOverrides(
   model: Model<Api>,
   options?: SimpleStreamOptions,
 ): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...model.samplingParams };
-  const perLevel = model.samplingParamsByThinkingLevel;
+  const perLevel = (model as Model<Api> & { samplingParamsByThinkingLevel?: PerLevelSampling })
+    .samplingParamsByThinkingLevel;
   const level = options?.reasoning;
   if (perLevel && level) {
     Object.assign(merged, perLevel[level] ?? {});
